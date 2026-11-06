@@ -1,0 +1,3 @@
+- insert:
+    - id: prompt-optimizer-nyco1d
+      name: 'dsh-prompt-optimizer-nyco1d'
