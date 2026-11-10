@@ -1,6 +1,6 @@
 {
   "name": "dsh-prompt-optimizer-nyco1d",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": false,
   "type": "module",
   "description": "在输入框旁一键优化提示词：左键优化并左右对比，右键切换优化模式与模型。",
@@ -39,6 +39,7 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "dsh": {

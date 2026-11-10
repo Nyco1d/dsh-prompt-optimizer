@@ -155,6 +155,8 @@ export const BUILTIN_MODES = [
     id: 'context-message-optimize',
     name: '消息优化',
     description: '把一句话改清楚：补指代、补条件、拆句子，保持原有语气和长度',
+    summary:
+      '只改写不动手：补齐指代和缺失条件、拆长句、去掉含糊的词；保持原语言和原语气。不替你回答，也不把一句话扩成一篇。',
     system: MESSAGE_REWRITE_SYSTEM,
     buildUser: wrapSource,
   },
@@ -162,6 +164,8 @@ export const BUILTIN_MODES = [
     id: 'general-optimize',
     name: '结构化重写',
     description: '把粗略想法扩写成角色设定：目的 / 定位 / 铁律 / 工作方式 / 能力 / 输出 / 假设；篇幅按用户诉求 350-1400 字',
+    summary:
+      '先判断你这句话里最在意哪一条，再按「目的 / 定位 / 铁律 / 工作方式 / 能力 / 输出 / 假设」产出角色设定，铁律最多 5 条且每条带「违反长这样」。你说「简洁」就压到 350-650 字的五节版。',
     system: STRUCTURED_REWRITE_SYSTEM,
     buildUser: (text) => wrapSource(text),
   },

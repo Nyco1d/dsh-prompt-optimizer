@@ -21,7 +21,7 @@ import { officialError, setAsarOverride } from './templates/official.js'
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const CONFIG_FILE = path.join(DSH_HOME, 'prompt-optimizer.json')
 const HISTORY_FILE = path.join(DSH_HOME, 'prompt-optimizer-history.json')
-const HISTORY_LIMIT = 20
+const HISTORY_LIMIT = 200
 const ROUTE_BASE = '/prompt-opt'
 const MAX_BODY = 512 * 1024
 
@@ -96,6 +96,29 @@ function sendJson(res, status, payload) {
   res.end(body)
 }
 
+// 本地 HTTP 面只服务 DSH 自己的页面。
+// 端口虽然只绑回环，但浏览器里任意网页都能向 127.0.0.1 发 POST（CORS 只挡读响应、不挡请求执行），
+// 所以按浏览器必带的 origin / referer 做一次同源校验，挡住 CSRF 式调用。
+// 没有来源头的是本机命令行或脚本（curl），放行。
+let SELF_ORIGIN = ''
+
+function sameOrigin(req) {
+  if (!SELF_ORIGIN) return true
+  const headers = (req && req.headers) || {}
+  const origin = typeof headers.origin === 'string' ? headers.origin : ''
+  if (origin) return origin === SELF_ORIGIN
+  const referer = typeof headers.referer === 'string' ? headers.referer : ''
+  if (referer) return referer === SELF_ORIGIN || referer.startsWith(SELF_ORIGIN + '/')
+  return true
+}
+
+/** 校验不过就直接回 403 并返回 true，调用方 `if (guard(req, res)) return` 即可。 */
+function guard(req, res) {
+  if (sameOrigin(req)) return false
+  sendJson(res, 403, { ok: false, error: 'forbidden: unexpected origin' })
+  return true
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0
@@ -139,10 +162,36 @@ function resolveSelection(ctx, wanted) {
 }
 
 async function runOptimize(ctx, req, res) {
+  if (guard(req, res)) return
   const body = await readBody(req)
   const text = typeof body.text === 'string' ? body.text : ''
+  // 流式：SSE 逐字推送。DSH 的压缩中间件对 text/event-stream 不动手，
+  // 再补 no-transform 兜一层，避免中间层缓存或改写。
+  const streaming = body.stream === true
+  let opened = false
+  function emit(payload) {
+    if (!opened) {
+      opened = true
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      })
+      if (typeof res.flushHeaders === 'function') res.flushHeaders()
+    }
+    res.write('data: ' + JSON.stringify(payload) + '\n\n')
+  }
+  function fail(status, message) {
+    if (streaming) {
+      emit({ type: 'error', ok: false, error: message })
+      res.end()
+      return
+    }
+    sendJson(res, status, { ok: false, error: message })
+  }
   if (!text.trim()) {
-    sendJson(res, 400, { ok: false, error: '草稿是空的，没有可优化的内容' })
+    fail(400, '草稿是空的，没有可优化的内容')
     return
   }
   const saved = readSettings()
@@ -151,7 +200,7 @@ async function runOptimize(ctx, req, res) {
   // 请求里明确指定了模式却找不到 → 报错。
   // 不报错的话 findMode 会静默回退到第一个模式，调用方会以为自己在测 A 模式，其实跑的是 B 模式。
   if (body.mode && mode.id !== body.mode) {
-    sendJson(res, 400, { ok: false, error: `未知的优化模式：${body.mode}` })
+    fail(400, `未知的优化模式：${body.mode}`)
     return
   }
   // 带指令迭代：不换模式，在上一版基础上按指令改。
@@ -164,7 +213,7 @@ async function runOptimize(ctx, req, res) {
     model: body.model ?? saved.model,
   })
   if (!selection) {
-    sendJson(res, 503, { ok: false, error: '没有可用的模型：请在 DSH 里先选好默认模型' })
+    fail(503, '没有可用的模型：请在 DSH 里先选好默认模型')
     return
   }
 
@@ -193,8 +242,10 @@ async function runOptimize(ctx, req, res) {
       signal: controller.signal,
     })
     for await (const chunk of chunks) {
-      if (chunk.type === 'text-delta') out += chunk.text
-      else if (chunk.type === 'finish') {
+      if (chunk.type === 'text-delta') {
+        out += chunk.text
+        if (streaming) emit({ type: 'delta', text: chunk.text })
+      } else if (chunk.type === 'finish') {
         const reason = chunk.reason
         if (reason && (reason.kind === 'error' || reason.kind === 'aborted')) {
           failure = reason.failure?.message || (reason.kind === 'aborted' ? '已取消' : '模型调用失败')
@@ -206,17 +257,17 @@ async function runOptimize(ctx, req, res) {
   }
 
   if (controller.signal.aborted && !out.trim()) {
-    sendJson(res, 200, { ok: false, error: '已取消' })
+    fail(200, '已取消')
     return
   }
   if (failure && !out.trim()) {
-    sendJson(res, 200, { ok: false, error: failure })
+    fail(200, failure)
     return
   }
 
   const optimized = normalizeOutput(out)
   if (!optimized) {
-    sendJson(res, 200, { ok: false, error: failure || '模型没有返回内容' })
+    fail(200, failure || '模型没有返回内容')
     return
   }
   appendHistory({
@@ -225,33 +276,41 @@ async function runOptimize(ctx, req, res) {
     mode: mode.id,
     instruction: iterating ? instruction : '',
   })
-  sendJson(res, 200, {
+  const payload = {
     ok: true,
     text: optimized,
     mode: mode.id,
     provider: selection.provider,
     model: selection.model,
-  })
+  }
+  if (streaming) {
+    emit({ type: 'done', ...payload })
+    res.end()
+    return
+  }
+  sendJson(res, 200, payload)
 }
 
-function listModes(_req, res) {
+function listModes(req, res) {
+  if (guard(req, res)) return
   const saved = readSettings()
   sendJson(res, 200, {
     ok: true,
     // 内置与官方模板只下发元信息，不下发 system 正文。
     // 自定义模板例外：用户要能在界面上改它，没有正文就没法编辑。
     // source 用来区分 builtin / official / custom，只有 custom 可编辑、可删。
-    modes: mergeModes(saved.customModes).map(({ id, name, description, source, system }) =>
+    modes: mergeModes(saved.customModes).map(({ id, name, description, summary, source, system }) =>
       source === 'custom'
-        ? { id, name, description, source, system }
-        : { id, name, description, source },
+        ? { id, name, description, summary: summary || description, source, system }
+        : { id, name, description, summary: summary || description, source },
     ),
     // 官方对照模式依赖本机安装的 PromptOptimizer；读不到时把原因带出去，方便排查
     officialError: officialError(),
   })
 }
 
-async function listModels(ctx, _req, res) {
+async function listModels(ctx, req, res) {
+  if (guard(req, res)) return
   const out = []
   const failures = []
   let providers = []
@@ -275,6 +334,7 @@ async function listModels(ctx, _req, res) {
 }
 
 function handleSettings(req, res) {
+  if (guard(req, res)) return
   const method = (req.method || 'GET').toUpperCase()
   if (method === 'GET') {
     sendJson(res, 200, { ok: true, ...readSettings() })
@@ -301,6 +361,7 @@ function handleSettings(req, res) {
 }
 
 function handleHistory(req, res) {
+  if (guard(req, res)) return
   const method = (req.method || 'GET').toUpperCase()
   if (method === 'GET') {
     sendJson(res, 200, { ok: true, items: readHistory() })
@@ -322,6 +383,12 @@ export function apply(ctx) {
     setAsarOverride(readSettings().asarPath)
   } catch {
     /* 配置读不到就按自动探测走 */
+  }
+  // 记下自身 origin，HTTP 路由用它做同源校验（拿不到就不校验，避免误伤）
+  try {
+    SELF_ORIGIN = typeof ctx.webServer.getOrigin === 'function' ? ctx.webServer.getOrigin() || '' : ''
+  } catch {
+    SELF_ORIGIN = ''
   }
   ctx.effect(() =>
     ctx.webServer.register({
